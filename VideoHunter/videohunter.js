@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoHunter
 // @namespace    https://tampermonkey.net/
-// @version      2.1
+// @version      2.3
 // @match        *://*/*
 // @allFrames    true
 // @grant        none
@@ -21,6 +21,9 @@
     let vhPolicy = null;
     let activeRecorder = null;
     let activeRecordBtn = null;
+    let activeRecordTimer = null;
+    let activeRecordVideo = null;
+    let activeRecordEndedHandler = null;
     let searchQuery = '';
 
     const ALLOWED_PROTOCOLS = new Set(['http:', 'https:', 'blob:', 'data:']);
@@ -603,47 +606,146 @@
         }
     }
 
-    function toggleRecording(videoEl, btn) {
+    function getOptimalRecordMime() {
+        const candidates = [
+            { mime: 'video/mp4;codecs=avc1,mp4a.40.2', ext: 'mp4' },
+            { mime: 'video/mp4;codecs=avc1', ext: 'mp4' },
+            { mime: 'video/mp4', ext: 'mp4' },
+            { mime: 'video/webm;codecs=h264,opus', ext: 'webm' },
+            { mime: 'video/webm;codecs=h264', ext: 'webm' },
+            { mime: 'video/webm;codecs=vp8,opus', ext: 'webm' },
+            { mime: 'video/webm;codecs=vp8', ext: 'webm' },
+            { mime: 'video/webm', ext: 'webm' }
+        ];
+        if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
+            for (const c of candidates) {
+                if (MediaRecorder.isTypeSupported(c.mime)) return c;
+            }
+        }
+        return { mime: '', ext: 'webm' };
+    }
+
+    function stopRecording(isError = false) {
+        if (activeRecordTimer) {
+            clearInterval(activeRecordTimer);
+            activeRecordTimer = null;
+        }
+        if (activeRecordVideo && activeRecordEndedHandler) {
+            activeRecordVideo.removeEventListener('ended', activeRecordEndedHandler);
+            activeRecordVideo = null;
+            activeRecordEndedHandler = null;
+        }
         if (activeRecorder) {
-            activeRecorder.stop();
+            try {
+                if (activeRecorder.state !== 'inactive') activeRecorder.stop();
+            } catch {}
             activeRecorder = null;
-            if (activeRecordBtn) {
-                activeRecordBtn.textContent = '⏺ Rec';
+        }
+        if (activeRecordBtn) {
+            activeRecordBtn.textContent = isError ? '✕ Error' : '⏺ Rec';
+            activeRecordBtn.disabled = false;
+            if (isError) {
+                setTimeout(() => {
+                    if (activeRecordBtn) activeRecordBtn.textContent = '⏺ Rec';
+                    activeRecordBtn = null;
+                }, 2000);
+            } else {
                 activeRecordBtn = null;
             }
+        }
+    }
+
+    function findActiveVideoEl(preferred) {
+        if (preferred && preferred.isConnected) return preferred;
+        const videos = Array.from(document.querySelectorAll('video'));
+        const playing = videos.find(v => !v.paused && !v.ended && v.readyState > 1);
+        if (playing) return playing;
+        const withSrc = videos.find(v => v.src || v.currentSrc || v.srcObject);
+        if (withSrc) return withSrc;
+        return videos[0] || null;
+    }
+
+    function toggleRecording(videoEl, btn) {
+        if (activeRecorder) {
+            stopRecording();
             return;
         }
 
-        if (!videoEl) {
+        const targetVideo = findActiveVideoEl(videoEl);
+        if (!targetVideo) {
             btn.textContent = 'No player';
             setTimeout(() => { btn.textContent = '⏺ Rec'; }, 1500);
             return;
         }
 
-        if (videoEl.mediaKeys) {
+        if (targetVideo.mediaKeys) {
             btn.textContent = 'DRM Locked';
             setTimeout(() => { btn.textContent = '⏺ Rec'; }, 2000);
             return;
         }
 
         try {
-            const stream = videoEl.captureStream ? videoEl.captureStream() : (videoEl.mozCaptureStream ? videoEl.mozCaptureStream() : null);
-            if (!stream) {
+            let stream = null;
+            if (typeof targetVideo.captureStream === 'function') {
+                try {
+                    stream = targetVideo.captureStream(60);
+                } catch {
+                    stream = targetVideo.captureStream();
+                }
+            } else if (typeof targetVideo.mozCaptureStream === 'function') {
+                try {
+                    stream = targetVideo.mozCaptureStream(60);
+                } catch {
+                    stream = targetVideo.mozCaptureStream();
+                }
+            }
+
+            if (!stream || !stream.getVideoTracks().length) {
                 btn.textContent = 'Unsupported';
+                setTimeout(() => { btn.textContent = '⏺ Rec'; }, 1800);
                 return;
             }
 
-            const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus') ? 'video/webm;codecs=vp9,opus' : 'video/webm';
-            const rec = new MediaRecorder(stream, { mimeType: mime });
-            const chunks = [];
+            stream.getAudioTracks().forEach(t => { t.enabled = true; });
 
-            rec.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+            const opt = getOptimalRecordMime();
+            const h = targetVideo.videoHeight || 720;
+            const videoBps = h >= 1440 ? 8000000 : (h >= 1080 ? 5000000 : (h >= 720 ? 3000000 : 2000000));
+
+            const recorderOptions = {
+                videoBitsPerSecond: videoBps,
+                audioBitsPerSecond: 128000
+            };
+            if (opt.mime) recorderOptions.mimeType = opt.mime;
+
+            const rec = new MediaRecorder(stream, recorderOptions);
+            const chunks = [];
+            let totalBytes = 0;
+            const startSec = Date.now();
+
+            rec.ondataavailable = e => {
+                if (e.data && e.data.size > 0) {
+                    chunks.push(e.data);
+                    totalBytes += e.data.size;
+                }
+            };
+
+            rec.onerror = () => {
+                stopRecording(true);
+            };
+
             rec.onstop = () => {
-                const blob = new Blob(chunks, { type: 'video/webm' });
+                if (activeRecordTimer) {
+                    clearInterval(activeRecordTimer);
+                    activeRecordTimer = null;
+                }
+                if (!chunks.length) return;
+                const finalType = opt.mime ? opt.mime.split(';')[0] : 'video/webm';
+                const blob = new Blob(chunks, { type: finalType });
                 const href = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = href;
-                a.download = `recorded_${Date.now()}.webm`;
+                a.download = `video_${Date.now()}.${opt.ext}`;
                 document.body.appendChild(a);
                 a.click();
                 a.remove();
@@ -653,7 +755,21 @@
             rec.start(1000);
             activeRecorder = rec;
             activeRecordBtn = btn;
-            btn.textContent = '⏹ Stop';
+            activeRecordVideo = targetVideo;
+
+            activeRecordEndedHandler = () => stopRecording();
+            targetVideo.addEventListener('ended', activeRecordEndedHandler, { once: true });
+
+            btn.textContent = '⏹ 00:00';
+            activeRecordTimer = setInterval(() => {
+                const elapsed = Math.floor((Date.now() - startSec) / 1000);
+                const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
+                const ss = String(elapsed % 60).padStart(2, '0');
+                const mb = (totalBytes / 1048576).toFixed(1);
+                if (activeRecordBtn) {
+                    activeRecordBtn.textContent = `⏹ ${mm}:${ss} (${mb}MB)`;
+                }
+            }, 1000);
         } catch (err) {
             btn.textContent = 'CORS Block';
             setTimeout(() => { btn.textContent = '⏺ Rec'; }, 2000);
@@ -1175,7 +1291,7 @@
                         `</div>`;
                 }
 
-                const isStream = item.type.startsWith('STREAM') && item.url.includes('.m3u8');
+                const isStream = item.type.startsWith('STREAM');
                 const isDirect = item.type.startsWith('DIRECT');
                 const isBlob = item.type.startsWith('BLOB');
 
@@ -1185,13 +1301,15 @@
                     <button class="vh-action-btn vh-btn-ff" type="button" data-url="${item.url}" title="Copy ffmpeg command">ffmpeg</button>
                 `;
 
-                if (isStream) {
+                if (isStream && item.url.includes('.m3u8')) {
                     actionButtons += `<button class="vh-action-btn vh-btn-dl-hls" type="button" data-url="${item.url}" title="Download complete HLS video to .ts">⬇ Download</button>`;
                 } else if (isDirect) {
                     actionButtons += `<a class="vh-action-btn" href="${item.url}" download="video_${item.id}.mp4" target="_blank" rel="noopener noreferrer" title="Download direct file">⬇ Download</a>`;
-                } else if (isBlob && item.videoEl) {
+                }
+
+                if (isStream || isBlob || isDirect) {
                     const isRecording = activeRecorder && activeRecordBtn?.getAttribute('data-id') === String(item.id);
-                    actionButtons += `<button class="vh-action-btn vh-btn-rec" type="button" data-id="${item.id}">${isRecording ? '⏹ Stop' : '⏺ Rec'}</button>`;
+                    actionButtons += `<button class="vh-action-btn vh-btn-rec" type="button" data-id="${item.id}" title="Record live playback in real time">${isRecording ? '⏹ Stop' : '⏺ Rec'}</button>`;
                 }
 
                 html += `
@@ -1252,8 +1370,11 @@
         });
 
         container.querySelectorAll('.vh-btn-rec').forEach(btn => {
+            const itemId = Number(btn.getAttribute('data-id'));
+            if (activeRecorder && activeRecordBtn && activeRecordBtn.getAttribute('data-id') === String(itemId)) {
+                activeRecordBtn = btn;
+            }
             btn.addEventListener('click', e => {
-                const itemId = Number(e.currentTarget.getAttribute('data-id'));
                 const item = [...found.values()].find(x => x.id === itemId);
                 if (item && item.videoEl) toggleRecording(item.videoEl, e.currentTarget);
             });
