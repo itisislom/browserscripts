@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         ZeroByte AdBlocker (Multi-Base uBlock Engine)
+// @name         ZeroByte AdBlocker By Islom
 // @namespace    https://tampermonkey.net/
 // @version      7.0
 // @match        *://*/*
