@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         ZeroByte AdBlocker
+// @name         ZeroByte AdBlocker (uBlock Engine Adapted)
 // @namespace    https://tampermonkey.net/
-// @version      3.0
+// @version      6.0
 // @match        *://*/*
 // @allFrames    true
 // @grant        none
@@ -11,14 +11,19 @@
 (() => {
     'use strict';
 
-    if (window.__zbShield) return;
-    window.__zbShield = true;
+    if (window.__zbUblockEngine) return;
+    window.__zbUblockEngine = true;
 
-    const AD_DOMAINS = [
+    const CACHE_KEY_DOMAINS = 'zb_ublock_domains';
+    const CACHE_KEY_TIMESTAMP = 'zb_ublock_last_sync';
+    const SYNC_INTERVAL_MS = 3 * 24 * 60 * 60 * 1000;
+    const REMOTE_LIST_URL = 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts';
+
+    const BUILTIN_DOMAINS = [
         'an.yandex.ru', 'bs.yandex.ru', 'mc.yandex.ru', 'yandexadexchange.net',
         'ads.adfox.ru', 'awaps.yandex.net', 'googlesyndication.com', 'doubleclick.net',
         'google-analytics.com', 'googletagmanager.com', 'googletagservices.com',
-        'adservice.google', 'pagead2.googlesyndication.com', '2mdn.net',
+        'adservice.google.com', 'pagead2.googlesyndication.com', '2mdn.net',
         'target.my.com', 'ad.mail.ru', 'r.mail.ru', 'top-fwz1.mail.ru',
         'ssp.rambler.ru', 'dsp.rambler.ru', 'relap.io', 'criteo.com', 'criteo.net',
         'taboola.com', 'outbrain.com', 'adnxs.com', 'rubiconproject.com',
@@ -26,12 +31,83 @@
         'adsterra.com', 'exoclick.com', 'juicyads.com', 'trafficjunky.net', 'mgid.com',
         'lentainform.com', 'smi2.ru', 'directadvert.ru', 'marketgid.com',
         'adriver.ru', 'adhigh.net', 'buzzoola.com', 'plausible.io',
-        'hotjar.com', 'adsystem', 'advertising.com'
+        'hotjar.com', 'reffpa.com', '3bmsp5yymz.com', 'deloton.com',
+        'clickadu.com', 'hilltopads.com', 'richpush.co', 'traffichaus.com',
+        'pinco7p7.win', 'pinco8p8.win', 'pincocasino.com', 'pin-up.win',
+        '1xbet.com', '1x-bet.com', 'melbet.com', 'mostbet.com', 'vavada.com',
+        '1win.pro', 'catcasino.com', 'betwinner.com', 'linebet.com'
     ];
 
-    const AD_HOST_REGEX = new RegExp('(^|\\.)(' + AD_DOMAINS.map(d => d.replace(/\./g, '\\.')).join('|') + ')$', 'i');
+    const blockSet = new Set(BUILTIN_DOMAINS);
 
-    const AD_PATH_REGEX = /\/(pagead\/|adsbygoogle\.js|tag\/js\/gpt\.js|adserver\/|adframe\.|popunder|clickunder|adv\/|1x1\.gif|pixel\.gif)/i;
+    function loadCachedDomains() {
+        try {
+            const raw = localStorage.getItem(CACHE_KEY_DOMAINS);
+            if (raw) {
+                const list = JSON.parse(raw);
+                if (Array.isArray(list)) {
+                    for (let i = 0; i < list.length; i++) {
+                        blockSet.add(list[i]);
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    loadCachedDomains();
+
+    async function syncRemoteDatabase() {
+        try {
+            const lastSync = Number(localStorage.getItem(CACHE_KEY_TIMESTAMP) || '0');
+            if (Date.now() - lastSync < SYNC_INTERVAL_MS) return;
+
+            const resp = await fetch(REMOTE_LIST_URL, { cache: 'no-cache' });
+            if (!resp.ok) return;
+
+            const text = await resp.text();
+            const lines = text.split('\n');
+            const newDomains = [];
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (!line || line.startsWith('#')) continue;
+                if (line.startsWith('0.0.0.0 ') || line.startsWith('127.0.0.1 ')) {
+                    const parts = line.split(/\s+/);
+                    if (parts[1] && parts[1] !== 'localhost' && !parts[1].endsWith('.local')) {
+                        const d = parts[1].toLowerCase();
+                        blockSet.add(d);
+                        if (newDomains.length < 25000) newDomains.push(d);
+                    }
+                }
+            }
+
+            localStorage.setItem(CACHE_KEY_DOMAINS, JSON.stringify(newDomains));
+            localStorage.setItem(CACHE_KEY_TIMESTAMP, String(Date.now()));
+        } catch {}
+    }
+
+    if (window === window.top) {
+        setTimeout(syncRemoteDatabase, 4000);
+    }
+
+    const GENERIC_AD_REGEX = /(^|\.)(agl\d+|cvt-s\d+|onclick\w+|bngpt\w+|adservice|adsystem|traffic\w+|pop\w+)\.(pro|shop|xyz|top|vip|click|link|fun|icu|buzz|com|win)$/i;
+    const CASINO_AFF_REGEX = /(3bmsp5yymz|reffpa|pinco|1x-?bet|pin-?up|melbet|mostbet|vavada|1win|vulkan|volcano|catcasino|joycasino|betwinner|linebet|up-x|dragonmoney|soqqa|pokerdom|spinbetter)/i;
+    const AD_PATH_REGEX = /\/(pagead\/|adsbygoogle\.js|tag\/js\/gpt\.js|adserver\/|adframe\.|popunder|clickunder|adv\/|1x1\.gif|pixel\.gif|\/o\/s\/[a-f0-9]{32}\.js|vast|vpaid|preroll|midroll|postroll)/i;
+    const AD_QUERY_REGEX = /[?&](tag=d_|project=casino|click_id=|pb=|form_email=|s3=|aff_id=|affiliate=|ref=|subid=)/i;
+
+    function isDomainBlocked(host) {
+        if (!host) return false;
+        let current = host.toLowerCase();
+        if (blockSet.has(current)) return true;
+
+        let dot = current.indexOf('.');
+        while (dot !== -1) {
+            current = current.slice(dot + 1);
+            if (blockSet.has(current)) return true;
+            dot = current.indexOf('.');
+        }
+        return false;
+    }
 
     function isAdUrl(rawUrl) {
         if (!rawUrl || typeof rawUrl !== 'string') return false;
@@ -44,18 +120,18 @@
             return false;
         }
 
-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
-            return false;
-        }
-
-        if (AD_HOST_REGEX.test(parsed.hostname)) return true;
+        const host = parsed.hostname;
+        if (isDomainBlocked(host)) return true;
+        if (GENERIC_AD_REGEX.test(host)) return true;
+        if (CASINO_AFF_REGEX.test(host)) return true;
         if (AD_PATH_REGEX.test(parsed.pathname)) return true;
+        if (AD_QUERY_REGEX.test(parsed.search)) return true;
+        if (CASINO_AFF_REGEX.test(parsed.search)) return true;
 
         return false;
     }
 
     const noop = () => {};
-    const noopPromise = () => Promise.resolve();
     const noopProxy = new Proxy(noop, {
         get: () => noopProxy,
         apply: () => noopProxy,
@@ -168,15 +244,47 @@
         }
     });
 
+    const originalAnchorClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function () {
+        if (isAdUrl(this.href)) return;
+        return originalAnchorClick.apply(this, arguments);
+    };
+
     const originalWindowOpen = window.open;
     window.open = function (url, ...args) {
-        if (url && isAdUrl(String(url))) {
+        if (!url || isAdUrl(String(url))) {
             return null;
         }
         return originalWindowOpen.call(this, url, ...args);
     };
 
-    const AD_SELECTORS = [
+    function preventAdClick(e) {
+        const target = e.target;
+        const anchor = target && target.closest ? target.closest('a') : null;
+        if (anchor && anchor.href && isAdUrl(anchor.href)) {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            anchor.remove();
+            return false;
+        }
+
+        const adContainer = target && target.closest ? target.closest('.ad-branding, .zplata, ins[data-cp-host], ins[data-key]') : null;
+        if (adContainer) {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            adContainer.remove();
+            return false;
+        }
+    }
+
+    ['click', 'auxclick', 'mousedown', 'pointerdown'].forEach(ev => {
+        window.addEventListener(ev, preventAdClick, true);
+        document.addEventListener(ev, preventAdClick, true);
+    });
+
+    const COSMETIC_RULES = [
         'ins.adsbygoogle',
         '[id^="yandex_rtb_"]',
         '[id^="adfox_"]',
@@ -187,19 +295,28 @@
         '[data-ad-format]',
         'iframe[src*="doubleclick"]',
         'iframe[src*="yandex"]',
+        'iframe[src*="agl0"]',
         'iframe[id*="google_ads"]',
         '.ad-banner', '.ad-container', '.ad-wrapper', '.ad-slot', '.ad-unit',
         '.adsbox', '.adv-block', '.sponsored-content',
         '.popunder', '[id^="mgid_"]', '[id^="taboola-"]',
+        '.ad-branding', '.branding', '[id*="branding"]', '[class*="branding"]', '.brand-wrapper',
+        '.zplata', 'ins[data-cp-host]', 'ins[data-key]', 'ins[data-cp-domain]', 'ins.604c7625',
+        '.kinogo-short', '[class*="above-player"]', '[class*="under-player"]',
+        'a[href*="reffpa"]', 'a[href*="3bmsp5yymz"]', 'a[href*="pinco"]', 'a[href*="1xbet"]',
+        'a[href*="pin-up"]', 'a[href*="casino"]', 'a[href*="kinogo.luxury"]',
         '.ytp-ad-overlay-container', '#player-ads', 'ytd-ad-slot-renderer',
         'ytd-in-feed-ad-layout-renderer', '.ytd-promoted-video-renderer'
     ].join(', ');
 
     function injectCSS() {
-        if (document.getElementById('zb-shield-css')) return;
+        if (document.getElementById('zb-ublock-css')) return;
         const style = document.createElement('style');
-        style.id = 'zb-shield-css';
-        style.textContent = `${AD_SELECTORS} { display: none !important; visibility: hidden !important; width: 0 !important; height: 0 !important; opacity: 0 !important; pointer-events: none !important; position: absolute !important; left: -9999px !important; }`;
+        style.id = 'zb-ublock-css';
+        style.textContent = `
+            ${COSMETIC_RULES} { display: none !important; visibility: hidden !important; width: 0 !important; height: 0 !important; opacity: 0 !important; pointer-events: none !important; position: absolute !important; left: -9999px !important; }
+            body.branded, div.branded { background-image: none !important; cursor: default !important; }
+        `;
         (document.head || document.documentElement).appendChild(style);
     }
 
@@ -226,13 +343,18 @@
     function cleanElement(el) {
         if (!el || el.nodeType !== 1) return;
 
+        if (el.tagName === 'BODY' && el.classList.contains('branded')) {
+            el.classList.remove('branded');
+            el.style.backgroundImage = 'none';
+        }
+
         const src = el.getAttribute && (el.getAttribute('src') || el.getAttribute('href'));
         if (src && isAdUrl(src)) {
             el.remove();
             return;
         }
 
-        if (el.matches && el.matches(AD_SELECTORS)) {
+        if (el.matches && el.matches(COSMETIC_RULES)) {
             el.remove();
             return;
         }
@@ -247,13 +369,19 @@
 
     function processBatch() {
         rafScheduled = false;
+
+        if (document.body && document.body.classList.contains('branded')) {
+            document.body.classList.remove('branded');
+            document.body.style.backgroundImage = 'none';
+        }
+
         const nodes = pendingNodes.splice(0);
         for (let i = 0; i < nodes.length; i++) {
             const node = nodes[i];
             if (node.isConnected) {
                 cleanElement(node);
                 if (node.querySelectorAll) {
-                    const matched = node.querySelectorAll(AD_SELECTORS);
+                    const matched = node.querySelectorAll(COSMETIC_RULES);
                     for (let j = 0; j < matched.length; j++) {
                         matched[j].remove();
                     }
