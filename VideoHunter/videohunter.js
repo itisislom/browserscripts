@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoHunter
 // @namespace    https://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @match        *://*/*
 // @allFrames    true
 // @grant        none
@@ -18,6 +18,7 @@
     let nextId = 1;
     let nextFrame = 1;
     let domTimer = null;
+    let vhPolicy = null;
 
     const ALLOWED_PROTOCOLS = new Set(['http:', 'https:', 'blob:', 'data:']);
     const MAX_ITEMS = 1000;
@@ -53,14 +54,26 @@
     };
     const SELECTOR = 'video, source, iframe, frame, audio, embed, object, a[href], [data-src], [data-video], [data-mp4], [data-url], [data-stream]';
 
-    function setSafeHTML(element, htmlString) {
-        try {
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(htmlString, 'text/html');
-            element.replaceChildren(...doc.body.childNodes);
-        } catch {
-            element.textContent = '';
+    function getTrustedHTML(htmlString) {
+        if (window.trustedTypes && window.trustedTypes.createPolicy) {
+            if (!vhPolicy) {
+                try {
+                    vhPolicy = window.trustedTypes.createPolicy('vh-policy-' + Date.now(), {
+                        createHTML: s => s
+                    });
+                } catch {
+                    try {
+                        vhPolicy = window.trustedTypes.defaultPolicy;
+                    } catch {}
+                }
+            }
+            if (vhPolicy) return vhPolicy.createHTML(htmlString);
         }
+        return htmlString;
+    }
+
+    function setSafeHTML(element, htmlString) {
+        element.innerHTML = getTrustedHTML(htmlString);
     }
 
     function normalizeUrl(raw, base) {
@@ -538,6 +551,10 @@
     let shadow = null;
     let modalEl = null;
 
+    function getHostParent() {
+        return document.fullscreenElement || document.body || document.documentElement;
+    }
+
     function createFloatingWindow() {
         if (hostEl) return;
         hostEl = document.createElement('div');
@@ -770,7 +787,7 @@
         });
 
         shadow.appendChild(modalEl);
-        (document.body || document.documentElement).appendChild(hostEl);
+        getHostParent().appendChild(hostEl);
     }
 
     function setupDragging(target, handle) {
@@ -907,6 +924,8 @@
         if (!hostEl) {
             createFloatingWindow();
         } else {
+            const parent = getHostParent();
+            if (!parent.contains(hostEl)) parent.appendChild(hostEl);
             hostEl.style.display = 'block';
         }
         renderItems();
@@ -928,6 +947,14 @@
             hideModal();
         }
     }, true);
+
+    document.addEventListener('fullscreenchange', () => {
+        if (hostEl && isModalOpen()) {
+            getHostParent().appendChild(hostEl);
+        }
+    });
+
+    window.addEventListener('yt-navigate-finish', () => scanAll(true));
 
     scanAll(true);
 })();
