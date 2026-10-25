@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoHunter
 // @namespace    https://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @match        *://*/*
 // @allFrames    true
 // @grant        none
@@ -53,6 +53,16 @@
     };
     const SELECTOR = 'video, source, iframe, frame, audio, embed, object, a[href], [data-src], [data-video], [data-mp4], [data-url], [data-stream]';
 
+    function setSafeHTML(element, htmlString) {
+        try {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(htmlString, 'text/html');
+            element.replaceChildren(...doc.body.childNodes);
+        } catch {
+            element.textContent = '';
+        }
+    }
+
     function normalizeUrl(raw, base) {
         if (!raw || typeof raw !== 'string') return null;
         let u = raw.trim()
@@ -71,6 +81,13 @@
         const path = parsed.pathname;
         if (url.startsWith('blob:')) return 'BLOB';
         if (meta.forceType) return meta.forceType;
+
+        if (parsed.hostname.includes('googlevideo.com') || path.includes('/videoplayback')) {
+            const mime = parsed.searchParams.get('mime') || '';
+            if (mime.includes('audio')) return 'AUDIO';
+            return 'DIRECT';
+        }
+
         if (REGEX.stream.test(path) || REGEX.streamInQuery.test(parsed.search)) return 'STREAM';
         if (!meta.fallbackType && REGEX.staticAsset.test(path)) return null;
         if (REGEX.segment.test(path)) return 'CHUNKS';
@@ -128,13 +145,21 @@
 
     function addMedia(rawUrl, source, meta = {}) {
         if (stopped) return;
-        const normalized = normalizeUrl(rawUrl, meta.base);
-        if (!normalized || normalized.length > 2000) return;
+        let normalized = normalizeUrl(rawUrl, meta.base);
+        if (!normalized || normalized.length > 3000) return;
 
         let parsed;
         try { parsed = new URL(normalized); } catch { return; }
         if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) return;
-        const url = parsed.href;
+
+        if (parsed.hostname.includes('googlevideo.com') || parsed.pathname.includes('/videoplayback')) {
+            parsed.searchParams.delete('range');
+            parsed.searchParams.delete('rn');
+            parsed.searchParams.delete('rbuf');
+            normalized = parsed.href;
+        }
+
+        const url = normalized;
 
         if (!isTop) {
             try {
@@ -201,6 +226,26 @@
         return null;
     }
 
+    function parseYouTubePlayerData(jsonText, ctxMeta) {
+        try {
+            const data = JSON.parse(jsonText);
+            const sd = data && (data.streamingData || data.playerResponse?.streamingData);
+            if (sd) {
+                const formats = [...(sd.formats || []), ...(sd.adaptiveFormats || [])];
+                formats.forEach(f => {
+                    if (f.url) {
+                        const isAudio = (f.mimeType || '').includes('audio');
+                        const res = f.qualityLabel || (isAudio ? 'Audio' : null);
+                        addMedia(f.url, 'YouTube Stream API', Object.assign({}, ctxMeta, {
+                            resolution: res,
+                            forceType: isAudio ? 'AUDIO' : 'DIRECT'
+                        }));
+                    }
+                });
+            }
+        } catch {}
+    }
+
     function hookWindow(w, label) {
         const ctxMeta = () => {
             try { return { frame: label, base: w.document.baseURI }; } catch { return { frame: label }; }
@@ -224,8 +269,11 @@
                         }
                         if (ct.includes('mpegurl') || ct.includes('json') || ct.includes('text') || ct.includes('javascript')) {
                             const len = parseInt(response.headers.get('content-length') || '0', 10);
-                            if (len < 2e6) {
+                            if (len < 3e6) {
                                 response.clone().text().then(txt => {
+                                    if (respUrl.includes('/youtubei/v1/player')) {
+                                        parseYouTubePlayerData(txt, ctxMeta());
+                                    }
                                     if (ct.includes('mpegurl') && isTop) {
                                         const q = parseM3u8Text(txt, respUrl);
                                         const it = found.get(respUrl);
@@ -264,6 +312,9 @@
                                 addMedia(respUrl, 'XHR Response', Object.assign(ctxMeta(), mediaMeta));
                             }
                             if (!this.responseType || this.responseType === 'text') {
+                                if (respUrl.includes('/youtubei/v1/player')) {
+                                    parseYouTubePlayerData(this.responseText, ctxMeta());
+                                }
                                 if (ct.includes('mpegurl') && isTop) {
                                     const q = parseM3u8Text(this.responseText, respUrl);
                                     const it = found.get(respUrl);
@@ -274,7 +325,11 @@
                                 }
                                 extractFromText(this.responseText, 'XHR Text Body', ctxMeta());
                             } else if (this.responseType === 'json' && this.response) {
-                                extractFromText(JSON.stringify(this.response), 'XHR JSON Body', ctxMeta());
+                                const jsonStr = JSON.stringify(this.response);
+                                if (respUrl.includes('/youtubei/v1/player')) {
+                                    parseYouTubePlayerData(jsonStr, ctxMeta());
+                                }
+                                extractFromText(jsonStr, 'XHR JSON Body', ctxMeta());
                             }
                         } catch {}
                     });
@@ -455,6 +510,7 @@
         if (isAltV || ((isInsert || isNumpad0) && !isEditing)) {
             e.preventDefault();
             e.stopPropagation();
+            e.stopImmediatePropagation();
             return true;
         }
         return false;
@@ -691,7 +747,7 @@
             modalEl.style.right = 'auto';
         }
 
-        modalEl.innerHTML = `
+        setSafeHTML(modalEl, `
             <div class="vh-bar" id="vh-drag-handle">
                 <div class="vh-title">
                     <span>VideoHunter</span>
@@ -704,7 +760,7 @@
             </div>
             <div class="vh-body" id="vh-content"></div>
             <div class="vh-foot">Made By Islom Sadriddinov</div>
-        `;
+        `);
 
         setupDragging(modalEl, modalEl.querySelector('#vh-drag-handle'));
         modalEl.querySelector('#vh-close-btn').addEventListener('click', hideModal);
@@ -787,7 +843,7 @@
         });
 
         if (!found.size) {
-            container.innerHTML = '<div class="vh-empty">No media detected yet.</div>';
+            setSafeHTML(container, '<div class="vh-empty">No media detected yet.</div>');
             return;
         }
 
@@ -832,7 +888,7 @@
             html += '</div></div>';
         });
 
-        container.innerHTML = html;
+        setSafeHTML(container, html);
 
         container.querySelectorAll('.vh-copy').forEach(btn => {
             btn.addEventListener('click', e => {
