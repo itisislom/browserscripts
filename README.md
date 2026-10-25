@@ -1,3 +1,3 @@
 # browserscripts
 
-All Islom Sadriddinov scripts for Tempermonkey.
+All Islom Sadriddinov scripts for Tampermonkey.
