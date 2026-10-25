@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Return YouTube Dislike (Fixed Clipping & Layout)
+// @name         Return YouTube Dislike
 // @namespace    https://github.com/Anarios/return-youtube-dislike
 // @version      11.8
 // @description  Исправлена обрезка счетчика, скрытие в новых интерфейсах YouTube, и запрос к API через fetch()
