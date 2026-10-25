@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoHunter
 // @namespace    https://tampermonkey.net/
-// @version      1.6
+// @version      2.0
 // @match        *://*/*
 // @allFrames    true
 // @grant        none
@@ -19,6 +19,9 @@
     let nextFrame = 1;
     let domTimer = null;
     let vhPolicy = null;
+    let activeRecorder = null;
+    let activeRecordBtn = null;
+    let searchQuery = '';
 
     const ALLOWED_PROTOCOLS = new Set(['http:', 'https:', 'blob:', 'data:']);
     const MAX_ITEMS = 1000;
@@ -529,6 +532,130 @@
         return false;
     }
 
+    async function downloadHlsStream(m3u8Url, btn) {
+        const origText = btn.textContent;
+        try {
+            btn.disabled = true;
+            btn.textContent = '⏳ Playlist...';
+
+            const resp = await fetch(m3u8Url, { credentials: 'omit' });
+            if (!resp.ok) throw new Error('Status ' + resp.status);
+            const text = await resp.text();
+            let lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+            let targetPlaylist = m3u8Url;
+
+            const isMaster = lines.some(l => l.startsWith('#EXT-X-STREAM-INF:'));
+            if (isMaster) {
+                for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].startsWith('#EXT-X-STREAM-INF:')) {
+                        const next = lines[i + 1];
+                        if (next && !next.startsWith('#')) {
+                            targetPlaylist = normalizeUrl(next, m3u8Url);
+                            break;
+                        }
+                    }
+                }
+                const subResp = await fetch(targetPlaylist, { credentials: 'omit' });
+                lines = (await subResp.text()).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+            }
+
+            const segmentUrls = [];
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (!line.startsWith('#')) {
+                    const segUrl = normalizeUrl(line, targetPlaylist);
+                    if (segUrl) segmentUrls.push(segUrl);
+                }
+            }
+
+            if (!segmentUrls.length) throw new Error('No segments');
+
+            const chunks = [];
+            for (let i = 0; i < segmentUrls.length; i++) {
+                const pct = Math.round(((i + 1) / segmentUrls.length) * 100);
+                btn.textContent = `⏳ ${i + 1}/${segmentUrls.length} (${pct}%)`;
+
+                const segResp = await fetch(segmentUrls[i], { credentials: 'omit' });
+                if (!segResp.ok) throw new Error('Segment error');
+                chunks.push(await segResp.arrayBuffer());
+            }
+
+            btn.textContent = '💾 Saving...';
+            const blob = new Blob(chunks, { type: 'video/mp2t' });
+            const dlUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = dlUrl;
+            a.download = `stream_${Date.now()}.ts`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(dlUrl), 30000);
+
+            btn.textContent = '✓ Done';
+            setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
+        } catch (err) {
+            btn.textContent = '✕ Error';
+            setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2500);
+        }
+    }
+
+    function toggleRecording(videoEl, btn) {
+        if (activeRecorder) {
+            activeRecorder.stop();
+            activeRecorder = null;
+            if (activeRecordBtn) {
+                activeRecordBtn.textContent = '⏺ Rec';
+                activeRecordBtn = null;
+            }
+            return;
+        }
+
+        if (!videoEl) {
+            btn.textContent = 'No player';
+            setTimeout(() => { btn.textContent = '⏺ Rec'; }, 1500);
+            return;
+        }
+
+        if (videoEl.mediaKeys) {
+            btn.textContent = 'DRM Locked';
+            setTimeout(() => { btn.textContent = '⏺ Rec'; }, 2000);
+            return;
+        }
+
+        try {
+            const stream = videoEl.captureStream ? videoEl.captureStream() : (videoEl.mozCaptureStream ? videoEl.mozCaptureStream() : null);
+            if (!stream) {
+                btn.textContent = 'Unsupported';
+                return;
+            }
+
+            const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus') ? 'video/webm;codecs=vp9,opus' : 'video/webm';
+            const rec = new MediaRecorder(stream, { mimeType: mime });
+            const chunks = [];
+
+            rec.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+            rec.onstop = () => {
+                const blob = new Blob(chunks, { type: 'video/webm' });
+                const href = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = href;
+                a.download = `recorded_${Date.now()}.webm`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(href), 30000);
+            };
+
+            rec.start(1000);
+            activeRecorder = rec;
+            activeRecordBtn = btn;
+            btn.textContent = '⏹ Stop';
+        } catch (err) {
+            btn.textContent = 'CORS Block';
+            setTimeout(() => { btn.textContent = '⏺ Rec'; }, 2000);
+        }
+    }
+
     if (!isTop) {
         scanAll(true);
         window.addEventListener('keydown', e => {
@@ -568,16 +695,16 @@
                 position: fixed;
                 top: 24px;
                 right: 24px;
-                width: 440px;
-                max-width: 90vw;
-                height: 520px;
-                max-height: 85vh;
+                width: 480px;
+                max-width: 92vw;
+                height: 560px;
+                max-height: 88vh;
                 background: #09182b;
                 border: 1.5px solid #00b4d8;
                 border-radius: 8px;
                 display: flex;
                 flex-direction: column;
-                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.65);
+                box-shadow: 0 12px 36px rgba(0, 0, 0, 0.7);
                 color: #e2e8f0;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                 overflow: hidden;
@@ -585,12 +712,12 @@
                 pointer-events: auto;
             }
             .vh-bar {
-                padding: 8px 12px;
+                padding: 7px 10px;
                 background: #0d213a;
                 border-bottom: 1px solid rgba(0, 180, 216, 0.3);
                 display: flex;
                 align-items: center;
-                justify-content: space-between;
+                gap: 8px;
                 cursor: grab;
                 user-select: none;
             }
@@ -603,7 +730,8 @@
                 color: #00b4d8;
                 display: flex;
                 align-items: center;
-                gap: 6px;
+                gap: 5px;
+                white-space: nowrap;
             }
             .vh-count {
                 font-size: 11px;
@@ -611,10 +739,23 @@
                 padding: 1px 6px;
                 border-radius: 10px;
             }
+            .vh-search {
+                flex: 1;
+                background: #071526;
+                border: 1px solid rgba(0, 180, 216, 0.3);
+                border-radius: 4px;
+                padding: 2px 7px;
+                color: #e2e8f0;
+                font-size: 11px;
+                outline: none;
+            }
+            .vh-search:focus {
+                border-color: #00b4d8;
+            }
             .vh-controls {
                 display: flex;
                 align-items: center;
-                gap: 6px;
+                gap: 4px;
             }
             .vh-btn {
                 background: transparent;
@@ -622,9 +763,10 @@
                 color: #00b4d8;
                 border-radius: 4px;
                 cursor: pointer;
-                padding: 2px 7px;
+                padding: 2px 6px;
                 font-size: 11px;
                 line-height: 1.2;
+                white-space: nowrap;
             }
             .vh-btn:hover {
                 background: #00b4d8;
@@ -662,13 +804,13 @@
             .vh-list {
                 display: flex;
                 flex-direction: column;
-                gap: 4px;
+                gap: 5px;
             }
             .vh-card {
                 background: #071424;
-                border: 1px solid rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.05);
                 border-radius: 4px;
-                padding: 5px 7px;
+                padding: 6px 8px;
                 font-size: 11px;
                 display: flex;
                 flex-direction: column;
@@ -686,21 +828,29 @@
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
-                max-width: 330px;
+                flex: 1;
             }
             .vh-url:hover {
                 text-decoration: underline;
             }
-            .vh-copy {
-                background: transparent;
-                border: none;
-                color: #64748b;
-                cursor: pointer;
-                font-size: 11px;
-                padding: 0 4px;
+            .vh-actions {
+                display: flex;
+                align-items: center;
+                gap: 3px;
             }
-            .vh-copy:hover {
+            .vh-action-btn {
+                background: rgba(0, 180, 216, 0.1);
+                border: 1px solid rgba(0, 180, 216, 0.3);
                 color: #00b4d8;
+                border-radius: 3px;
+                cursor: pointer;
+                font-size: 10px;
+                padding: 1px 5px;
+                line-height: 1.2;
+            }
+            .vh-action-btn:hover {
+                background: #00b4d8;
+                color: #09182b;
             }
             .vh-sub {
                 color: #64748b;
@@ -770,8 +920,10 @@
                     <span>VideoHunter</span>
                     <span class="vh-count" id="vh-total">0</span>
                 </div>
+                <input class="vh-search" id="vh-filter-input" type="text" placeholder="Filter..." />
                 <div class="vh-controls">
                     <button class="vh-btn" id="vh-scan-btn" type="button">Scan</button>
+                    <button class="vh-btn" id="vh-clear-btn" type="button">Clear</button>
                     <button class="vh-btn" id="vh-close-btn" type="button">✕</button>
                 </div>
             </div>
@@ -783,6 +935,17 @@
         modalEl.querySelector('#vh-close-btn').addEventListener('click', hideModal);
         modalEl.querySelector('#vh-scan-btn').addEventListener('click', () => {
             scanAll(true);
+            renderItems();
+        });
+        modalEl.querySelector('#vh-clear-btn').addEventListener('click', () => {
+            found.clear();
+            rawSegments.clear();
+            renderItems();
+        });
+
+        const filterInput = modalEl.querySelector('#vh-filter-input');
+        filterInput.addEventListener('input', e => {
+            searchQuery = e.target.value.toLowerCase().trim();
             renderItems();
         });
 
@@ -798,7 +961,7 @@
         let origTop = 0;
 
         handle.addEventListener('mousedown', e => {
-            if (e.target.tagName === 'BUTTON') return;
+            if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
             isDown = true;
             startX = e.clientX;
             startY = e.clientY;
@@ -845,6 +1008,10 @@
         return hostEl && hostEl.style.display !== 'none';
     }
 
+    function shellArg(url) {
+        return '"' + url.replace(/["`$\\]/g, c => encodeURIComponent(c)) + '"';
+    }
+
     function renderItems() {
         if (!shadow) return;
         const container = shadow.getElementById('vh-content');
@@ -855,12 +1022,13 @@
 
         const by = {};
         found.forEach(i => {
+            if (searchQuery && !i.url.toLowerCase().includes(searchQuery)) return;
             const k = catKey(i.type);
             (by[k] = by[k] || []).push(i);
         });
 
         if (!found.size) {
-            setSafeHTML(container, '<div class="vh-empty">No media detected yet.</div>');
+            setSafeHTML(container, '<div class="vh-empty">No media detected yet. Play a video or trigger streaming.</div>');
             return;
         }
 
@@ -890,11 +1058,30 @@
                         `</div>`;
                 }
 
+                const isStream = item.type.startsWith('STREAM') && item.url.includes('.m3u8');
+                const isDirect = item.type.startsWith('DIRECT');
+                const isBlob = item.type.startsWith('BLOB');
+
+                let actionButtons = `
+                    <button class="vh-action-btn vh-btn-copy" type="button" data-url="${item.url}" title="Copy URL">📋</button>
+                    <button class="vh-action-btn vh-btn-ytdl" type="button" data-url="${item.url}" title="Copy yt-dlp command">yt-dlp</button>
+                    <button class="vh-action-btn vh-btn-ff" type="button" data-url="${item.url}" title="Copy ffmpeg command">ffmpeg</button>
+                `;
+
+                if (isStream) {
+                    actionButtons += `<button class="vh-action-btn vh-btn-dl-hls" type="button" data-url="${item.url}" title="Download complete HLS video to .ts">⬇ Download</button>`;
+                } else if (isDirect) {
+                    actionButtons += `<a class="vh-action-btn" href="${item.url}" download="video_${item.id}.mp4" target="_blank" rel="noopener noreferrer" title="Download direct file">⬇ Download</a>`;
+                } else if (isBlob && item.videoEl) {
+                    const isRecording = activeRecorder && activeRecordBtn?.getAttribute('data-id') === String(item.id);
+                    actionButtons += `<button class="vh-action-btn vh-btn-rec" type="button" data-id="${item.id}">${isRecording ? '⏹ Stop' : '⏺ Rec'}</button>`;
+                }
+
                 html += `
                     <div class="vh-card">
                         <div class="vh-link-row">
                             <a class="vh-url" href="${item.url}" target="_blank" rel="noopener noreferrer" title="${item.url}">${item.url}</a>
-                            <button class="vh-copy" type="button" data-url="${item.url}" title="Copy">📋</button>
+                            <div class="vh-actions">${actionButtons}</div>
                         </div>
                         ${metaParts.length ? `<div class="vh-sub">${metaParts.join(' • ')}</div>` : ''}
                         ${qualitiesHtml}
@@ -907,7 +1094,7 @@
 
         setSafeHTML(container, html);
 
-        container.querySelectorAll('.vh-copy').forEach(btn => {
+        container.querySelectorAll('.vh-btn-copy').forEach(btn => {
             btn.addEventListener('click', e => {
                 const targetUrl = e.currentTarget.getAttribute('data-url');
                 if (targetUrl) {
@@ -915,6 +1102,43 @@
                     e.currentTarget.textContent = '✓';
                     setTimeout(() => { e.currentTarget.textContent = '📋'; }, 1200);
                 }
+            });
+        });
+
+        container.querySelectorAll('.vh-btn-ytdl').forEach(btn => {
+            btn.addEventListener('click', e => {
+                const targetUrl = e.currentTarget.getAttribute('data-url');
+                if (targetUrl) {
+                    navigator.clipboard.writeText(`yt-dlp ${shellArg(targetUrl)}`);
+                    e.currentTarget.textContent = '✓';
+                    setTimeout(() => { e.currentTarget.textContent = 'yt-dlp'; }, 1200);
+                }
+            });
+        });
+
+        container.querySelectorAll('.vh-btn-ff').forEach(btn => {
+            btn.addEventListener('click', e => {
+                const targetUrl = e.currentTarget.getAttribute('data-url');
+                if (targetUrl) {
+                    navigator.clipboard.writeText(`ffmpeg -i ${shellArg(targetUrl)} -c copy output.mp4`);
+                    e.currentTarget.textContent = '✓';
+                    setTimeout(() => { e.currentTarget.textContent = 'ffmpeg'; }, 1200);
+                }
+            });
+        });
+
+        container.querySelectorAll('.vh-btn-dl-hls').forEach(btn => {
+            btn.addEventListener('click', e => {
+                const targetUrl = e.currentTarget.getAttribute('data-url');
+                if (targetUrl) downloadHlsStream(targetUrl, e.currentTarget);
+            });
+        });
+
+        container.querySelectorAll('.vh-btn-rec').forEach(btn => {
+            btn.addEventListener('click', e => {
+                const itemId = Number(e.currentTarget.getAttribute('data-id'));
+                const item = [...found.values()].find(x => x.id === itemId);
+                if (item && item.videoEl) toggleRecording(item.videoEl, e.currentTarget);
             });
         });
     }
