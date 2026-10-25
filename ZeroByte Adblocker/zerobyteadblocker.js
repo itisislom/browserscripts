@@ -1,23 +1,30 @@
 // ==UserScript==
-// @name         ZeroByte AdBlocker (uBlock Engine Adapted)
+// @name         ZeroByte AdBlocker (Multi-Base uBlock Engine)
 // @namespace    https://tampermonkey.net/
-// @version      6.0
+// @version      7.0
 // @match        *://*/*
 // @allFrames    true
-// @grant        none
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
 
 (() => {
     'use strict';
 
-    if (window.__zbUblockEngine) return;
-    window.__zbUblockEngine = true;
+    const targetWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    if (targetWindow.__zbMultiShield) return;
+    targetWindow.__zbMultiShield = true;
 
-    const CACHE_KEY_DOMAINS = 'zb_ublock_domains';
-    const CACHE_KEY_TIMESTAMP = 'zb_ublock_last_sync';
     const SYNC_INTERVAL_MS = 3 * 24 * 60 * 60 * 1000;
-    const REMOTE_LIST_URL = 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts';
+
+    const SOURCES = [
+        'https://raw.githubusercontent.com/easylist/ruadlist/master/advblock/adservers.txt',
+        'https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt',
+        'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/light.txt',
+        'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts'
+    ];
 
     const BUILTIN_DOMAINS = [
         'an.yandex.ru', 'bs.yandex.ru', 'mc.yandex.ru', 'yandexadexchange.net',
@@ -40,54 +47,78 @@
 
     const blockSet = new Set(BUILTIN_DOMAINS);
 
-    function loadCachedDomains() {
+    function loadCached() {
         try {
-            const raw = localStorage.getItem(CACHE_KEY_DOMAINS);
-            if (raw) {
-                const list = JSON.parse(raw);
-                if (Array.isArray(list)) {
-                    for (let i = 0; i < list.length; i++) {
-                        blockSet.add(list[i]);
-                    }
+            const cached = typeof GM_getValue === 'function' ? GM_getValue('zb_ad_domains', null) : null;
+            if (Array.isArray(cached)) {
+                for (let i = 0; i < cached.length; i++) {
+                    blockSet.add(cached[i]);
                 }
             }
         } catch {}
     }
 
-    loadCachedDomains();
+    loadCached();
 
-    async function syncRemoteDatabase() {
+    function extractDomain(line) {
+        line = line.trim();
+        if (!line || line.startsWith('#') || line.startsWith('!')) return null;
+
+        if (line.startsWith('0.0.0.0 ') || line.startsWith('127.0.0.1 ')) {
+            const parts = line.split(/\s+/);
+            if (parts[1] && parts[1] !== 'localhost' && !parts[1].endsWith('.local')) {
+                return parts[1].toLowerCase();
+            }
+        }
+
+        if (line.startsWith('||') && line.includes('^')) {
+            const end = line.indexOf('^');
+            const d = line.slice(2, end).toLowerCase();
+            if (d && !d.includes('/') && !d.includes('*') && !d.includes('$')) return d;
+        }
+
+        if (/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(line)) {
+            return line.toLowerCase();
+        }
+
+        return null;
+    }
+
+    async function syncDatabases() {
         try {
-            const lastSync = Number(localStorage.getItem(CACHE_KEY_TIMESTAMP) || '0');
+            const lastSync = Number((typeof GM_getValue === 'function' ? GM_getValue('zb_last_sync', 0) : 0) || 0);
             if (Date.now() - lastSync < SYNC_INTERVAL_MS) return;
 
-            const resp = await fetch(REMOTE_LIST_URL, { cache: 'no-cache' });
-            if (!resp.ok) return;
+            const newDomains = new Set();
 
-            const text = await resp.text();
-            const lines = text.split('\n');
-            const newDomains = [];
+            for (let i = 0; i < SOURCES.length; i++) {
+                try {
+                    const resp = await fetch(SOURCES[i], { cache: 'no-cache' });
+                    if (!resp.ok) continue;
 
-            for (let i = 0; i < lines.length; i++) {
-                const line = lines[i].trim();
-                if (!line || line.startsWith('#')) continue;
-                if (line.startsWith('0.0.0.0 ') || line.startsWith('127.0.0.1 ')) {
-                    const parts = line.split(/\s+/);
-                    if (parts[1] && parts[1] !== 'localhost' && !parts[1].endsWith('.local')) {
-                        const d = parts[1].toLowerCase();
-                        blockSet.add(d);
-                        if (newDomains.length < 25000) newDomains.push(d);
+                    const text = await resp.text();
+                    const lines = text.split('\n');
+
+                    for (let j = 0; j < lines.length; j++) {
+                        const d = extractDomain(lines[j]);
+                        if (d) {
+                            newDomains.add(d);
+                            blockSet.add(d);
+                            if (newDomains.size >= 80000) break;
+                        }
                     }
-                }
+                } catch {}
             }
 
-            localStorage.setItem(CACHE_KEY_DOMAINS, JSON.stringify(newDomains));
-            localStorage.setItem(CACHE_KEY_TIMESTAMP, String(Date.now()));
+            if (newDomains.size > 0 && typeof GM_setValue === 'function') {
+                GM_setValue('zb_ad_domains', Array.from(newDomains));
+                GM_setValue('zb_last_sync', Date.now());
+            }
         } catch {}
     }
 
-    if (window === window.top) {
-        setTimeout(syncRemoteDatabase, 4000);
+    if (targetWindow === targetWindow.top) {
+        setTimeout(syncDatabases, 5000);
     }
 
     const GENERIC_AD_REGEX = /(^|\.)(agl\d+|cvt-s\d+|onclick\w+|bngpt\w+|adservice|adsystem|traffic\w+|pop\w+)\.(pro|shop|xyz|top|vip|click|link|fun|icu|buzz|com|win)$/i;
@@ -138,8 +169,8 @@
         construct: () => noopProxy
     });
 
-    window.adsbygoogle = Object.assign([], { loaded: true, push: noop });
-    window.googletag = {
+    targetWindow.adsbygoogle = Object.assign([], { loaded: true, push: noop });
+    targetWindow.googletag = {
         cmd: Object.assign([], { push: fn => { try { if (typeof fn === 'function') fn(); } catch {} } }),
         pubads: () => noopProxy,
         enableServices: noop,
@@ -147,18 +178,18 @@
         defineSlot: () => noopProxy
     };
 
-    window.yaContextCb = Object.assign([], { push: fn => { try { if (typeof fn === 'function') fn(); } catch {} } });
-    window.Ya = window.Ya || {};
-    window.Ya.Context = { AdvManager: { render: noop, renderWidget: noop } };
-    window.Ya.adfoxCode = { create: noop, createAdaptive: noop, createScroll: noop };
+    targetWindow.yaContextCb = Object.assign([], { push: fn => { try { if (typeof fn === 'function') fn(); } catch {} } });
+    targetWindow.Ya = targetWindow.Ya || {};
+    targetWindow.Ya.Context = { AdvManager: { render: noop, renderWidget: noop } };
+    targetWindow.Ya.adfoxCode = { create: noop, createAdaptive: noop, createScroll: noop };
 
-    window._tmr = Object.assign([], { push: noop });
-    window.ym = noop;
-    window.ga = noop;
-    window.gtag = noop;
+    targetWindow._tmr = Object.assign([], { push: noop });
+    targetWindow.ym = noop;
+    targetWindow.ga = noop;
+    targetWindow.gtag = noop;
 
-    const originalFetch = window.fetch;
-    window.fetch = async function (...args) {
+    const originalFetch = targetWindow.fetch;
+    targetWindow.fetch = async function (...args) {
         const input = args[0];
         const url = typeof input === 'string' ? input : (input && (input.url || input.href));
         if (isAdUrl(url)) {
@@ -167,10 +198,10 @@
         return originalFetch.apply(this, args);
     };
 
-    const originalXhrOpen = XMLHttpRequest.prototype.open;
-    const originalXhrSend = XMLHttpRequest.prototype.send;
+    const originalXhrOpen = targetWindow.XMLHttpRequest.prototype.open;
+    const originalXhrSend = targetWindow.XMLHttpRequest.prototype.send;
 
-    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    targetWindow.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
         this.__isAdBlocked = isAdUrl(String(url));
         if (this.__isAdBlocked) {
             return originalXhrOpen.call(this, method, 'data:text/plain,', ...rest);
@@ -178,7 +209,7 @@
         return originalXhrOpen.call(this, method, url, ...rest);
     };
 
-    XMLHttpRequest.prototype.send = function (...args) {
+    targetWindow.XMLHttpRequest.prototype.send = function (...args) {
         if (this.__isAdBlocked) {
             queueMicrotask(() => {
                 Object.defineProperty(this, 'readyState', { value: 4, configurable: true });
@@ -195,16 +226,16 @@
         return originalXhrSend.apply(this, args);
     };
 
-    if (navigator.sendBeacon) {
-        const originalBeacon = navigator.sendBeacon;
-        navigator.sendBeacon = function (url, data) {
+    if (targetWindow.navigator.sendBeacon) {
+        const originalBeacon = targetWindow.navigator.sendBeacon;
+        targetWindow.navigator.sendBeacon = function (url, data) {
             if (isAdUrl(url)) return true;
             return originalBeacon.call(this, url, data);
         };
     }
 
-    const OriginalWebSocket = window.WebSocket;
-    window.WebSocket = function (url, protocols) {
+    const OriginalWebSocket = targetWindow.WebSocket;
+    targetWindow.WebSocket = function (url, protocols) {
         if (isAdUrl(url)) {
             return {
                 close: noop,
@@ -216,10 +247,10 @@
         }
         return protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
     };
-    window.WebSocket.prototype = OriginalWebSocket.prototype;
+    targetWindow.WebSocket.prototype = OriginalWebSocket.prototype;
 
-    const originalSetAttribute = Element.prototype.setAttribute;
-    Element.prototype.setAttribute = function (name, value) {
+    const originalSetAttribute = targetWindow.Element.prototype.setAttribute;
+    targetWindow.Element.prototype.setAttribute = function (name, value) {
         if ((name === 'src' || name === 'href') && isAdUrl(String(value))) {
             if (this.tagName === 'IMG') {
                 return originalSetAttribute.call(this, 'src', 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7');
@@ -229,7 +260,7 @@
         return originalSetAttribute.call(this, name, value);
     };
 
-    [HTMLScriptElement, HTMLIFrameElement, HTMLImageElement, HTMLMediaElement, HTMLSourceElement].forEach(cls => {
+    [targetWindow.HTMLScriptElement, targetWindow.HTMLIFrameElement, targetWindow.HTMLImageElement, targetWindow.HTMLMediaElement, targetWindow.HTMLSourceElement].forEach(cls => {
         if (!cls || !cls.prototype) return;
         const desc = Object.getOwnPropertyDescriptor(cls.prototype, 'src');
         if (desc && desc.set) {
@@ -244,14 +275,14 @@
         }
     });
 
-    const originalAnchorClick = HTMLAnchorElement.prototype.click;
-    HTMLAnchorElement.prototype.click = function () {
+    const originalAnchorClick = targetWindow.HTMLAnchorElement.prototype.click;
+    targetWindow.HTMLAnchorElement.prototype.click = function () {
         if (isAdUrl(this.href)) return;
         return originalAnchorClick.apply(this, arguments);
     };
 
-    const originalWindowOpen = window.open;
-    window.open = function (url, ...args) {
+    const originalWindowOpen = targetWindow.open;
+    targetWindow.open = function (url, ...args) {
         if (!url || isAdUrl(String(url))) {
             return null;
         }
@@ -280,8 +311,8 @@
     }
 
     ['click', 'auxclick', 'mousedown', 'pointerdown'].forEach(ev => {
-        window.addEventListener(ev, preventAdClick, true);
-        document.addEventListener(ev, preventAdClick, true);
+        targetWindow.addEventListener(ev, preventAdClick, true);
+        targetWindow.document.addEventListener(ev, preventAdClick, true);
     });
 
     const COSMETIC_RULES = [
@@ -310,24 +341,24 @@
     ].join(', ');
 
     function injectCSS() {
-        if (document.getElementById('zb-ublock-css')) return;
-        const style = document.createElement('style');
+        if (targetWindow.document.getElementById('zb-ublock-css')) return;
+        const style = targetWindow.document.createElement('style');
         style.id = 'zb-ublock-css';
         style.textContent = `
             ${COSMETIC_RULES} { display: none !important; visibility: hidden !important; width: 0 !important; height: 0 !important; opacity: 0 !important; pointer-events: none !important; position: absolute !important; left: -9999px !important; }
             body.branded, div.branded { background-image: none !important; cursor: default !important; }
         `;
-        (document.head || document.documentElement).appendChild(style);
+        (targetWindow.document.head || targetWindow.document.documentElement).appendChild(style);
     }
 
-    if (document.documentElement) {
+    if (targetWindow.document.documentElement) {
         injectCSS();
     } else {
-        window.addEventListener('DOMContentLoaded', injectCSS, { once: true });
+        targetWindow.addEventListener('DOMContentLoaded', injectCSS, { once: true });
     }
 
     function fastForwardVideoAd() {
-        const player = document.querySelector('.html5-video-player, #movie_player');
+        const player = targetWindow.document.querySelector('.html5-video-player, #movie_player');
         if (player && (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting'))) {
             const video = player.querySelector('video');
             if (video && isFinite(video.duration) && video.duration > 0) {
@@ -335,7 +366,7 @@
                 video.playbackRate = 16;
                 video.currentTime = video.duration;
             }
-            const skipBtn = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern, button.ytp-ad-skip-button');
+            const skipBtn = targetWindow.document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern, button.ytp-ad-skip-button');
             if (skipBtn) skipBtn.click();
         }
     }
@@ -370,9 +401,9 @@
     function processBatch() {
         rafScheduled = false;
 
-        if (document.body && document.body.classList.contains('branded')) {
-            document.body.classList.remove('branded');
-            document.body.style.backgroundImage = 'none';
+        if (targetWindow.document.body && targetWindow.document.body.classList.contains('branded')) {
+            targetWindow.document.body.classList.remove('branded');
+            targetWindow.document.body.style.backgroundImage = 'none';
         }
 
         const nodes = pendingNodes.splice(0);
@@ -406,7 +437,7 @@
         }
     });
 
-    observer.observe(document, {
+    observer.observe(targetWindow.document, {
         childList: true,
         subtree: true
     });
